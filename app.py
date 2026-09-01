@@ -5,6 +5,7 @@ import streamlit as st
 from google import genai
 from google.genai.errors import ClientError
 from dotenv import load_dotenv
+from invoice_intelligence.analysis import extract_risk_tier, json_to_csv
 
 load_dotenv()
 
@@ -302,17 +303,11 @@ if analyze_clicked and invoice_text.strip():
                 raw_analysis_response = client.models.generate_content(model='gemini-3.6-flash', contents=analyst_prompt)
                 raw_analysis = raw_analysis_response.text.strip()
                 
-                risk_tier = "MODERATE"
+                risk_tier = extract_risk_tier(raw_analysis)
                 audit_text = raw_analysis
-                if "[CRITICAL]" in raw_analysis:
-                    risk_tier = "CRITICAL"
-                    audit_text = raw_analysis.replace("[CRITICAL]", "").strip()
-                elif "[SECURE]" in raw_analysis:
-                    risk_tier = "SECURE"
-                    audit_text = raw_analysis.replace("[SECURE]", "").strip()
-                elif "[MODERATE]" in raw_analysis:
-                    risk_tier = "MODERATE"
-                    audit_text = raw_analysis.replace("[MODERATE]", "").strip()
+
+                for tier in ("CRITICAL", "SECURE", "MODERATE"):
+                    audit_text = audit_text.replace(f"[{tier}]", "").strip()
 
             formatted_audit_html = audit_text.replace('\n', '<br>')
             
@@ -357,9 +352,7 @@ if analyze_clicked and invoice_text.strip():
             parsed_json = json.loads(extracted_json)
             json_string = json.dumps(parsed_json, indent=2)
             
-            csv_headers = ",".join(parsed_json.keys())
-            csv_values = ",".join([f'"{str(v)}"' for v in parsed_json.values()])
-            csv_string = f"{csv_headers}\n{csv_values}"
+            csv_string = json_to_csv(extracted_json)
             
             d_col1, d_col2 = st.columns(2)
             with d_col1:
