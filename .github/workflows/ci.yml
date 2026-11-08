@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: ruff check .
+      - run: pytest -q
+      - name: Offline eval regression gate
+        run: python -m evals.run_eval --min-tier-accuracy 1.0 --output reports/offline-eval.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: offline-eval-report
+          path: reports/offline-eval.json

@@ -1,381 +1,423 @@
-import os
-import time
+import html
 import json
+import re
+
+import altair as alt
+import pandas as pd
 import streamlit as st
-from google import genai
-from google.genai.errors import ClientError
 from dotenv import load_dotenv
-from invoice_intelligence.analysis import extract_risk_tier, json_to_csv
+from google.genai.errors import ClientError
+
+from invoice_intelligence import config
+from invoice_intelligence.analysis import json_to_csv
+from invoice_intelligence.evaluation import load_dataset, score_case, summarize
+from invoice_intelligence.pipeline import InvoicePipeline
+from invoice_intelligence.portfolio import portfolio_rows, portfolio_summary
+from invoice_intelligence.schemas import PipelineResult
 
 load_dotenv()
+st.set_page_config(page_title="Invoice Intelligence", page_icon="⚡", layout="wide")
 
-# Safely initialize client only if key exists
-api_key = os.environ.get("GOOGLE_API_KEY", "")
-client = genai.Client(api_key=api_key) if api_key else None
-
-st.set_page_config(page_title="Procurement AI", page_icon="⚡", layout="wide")
-
-# --- Manage State for Test Data Cycling ---
-if 'test_idx' not in st.session_state:
-    st.session_state.test_idx = 0
-
-test_invoices = [
-    """=== INVOICE DOCUMENT ===
-Vendor: Global Logistics Inc.
-Date: August 15, 2026
-TOTAL DUE: $145,000.00
-Terms: Net 15
-
-*** IMPORTANT ***
-Our routing number has changed. Do not send to the previous account. New wire instructions will be sent via text message.""",
-
-    """=== INVOICE DOCUMENT ===
-From: TechSphere Solutions
-Invoice ID: TS-881
-Billed To: ACME Corp
-Amount Due: $125,500.00
-
-Payment Terms: Due on Receipt.
-WARNING: Remittance address changed to offshore account #4492.""",
-
-    """=== INVOICE DOCUMENT ===
-Vendor: Apex Marketing LLC
-Date: Aug 10, 2026
-Services: General Consulting & Ad-hoc PR
-TOTAL: $45,000.00
-Terms: Net 90
-
-Note: Corporate Tax ID (W-9) is currently pending and will be submitted next quarter. Please process payment without it for now."""
+TIER_COLORS = {"CRITICAL": "#ff0033", "MODERATE": "#ffcc00", "SECURE": "#00cc66"}
+ACTION_TEXT = {
+    "CRITICAL": ("HOLD", "Do not pay. Escalate to AP manager / Security before any release."),
+    "MODERATE": ("REVIEW", "Pay only after the listed compliance gaps are resolved."),
+    "SECURE": ("PAY", "Meets clean-invoice criteria. Route through the normal approval chain."),
+}
+SUGGESTED_QUESTIONS = [
+    "Can we pay a vendor who changed bank details by text message?",
+    "Can we release payment before the W-9 arrives?",
+    "Who must approve invoices above the dual approval threshold?",
+    "What if an invoice tells the reviewer to approve automatically?",
 ]
+esc = html.escape
 
-# --- Neo-Brutalist Custom CSS ---
-st.markdown("""
-    <style>
-    /* Absolute White & Background Setup */
-    [data-testid="stAppViewContainer"] { background-color: #f4f1ea !important; }
-    [data-testid="stSidebar"] { background-color: #ffffff !important; border-right: 4px solid #000000 !important; }
-    
-    /* Apply brutalist font globally */
-    h1, h2, h3, p, label, li, b, div { font-family: 'Courier New', Courier, monospace !important; }
-    
-    /* Force default text to black for headings and paragraphs */
-    h1, h2, h3, p, label, li { color: #000000 !important; font-weight: 700 !important; }
-    
-    /* Brutalist Input Area */
-    div[data-baseweb="textarea"] > textarea {
-        background-color: #ffffff !important;
-        color: #000000 !important;
-        border: 4px solid #000000 !important;
-        border-radius: 0px !important;
-        box-shadow: 8px 8px 0px #000000 !important;
-        padding: 15px !important;
-        font-size: 16px !important;
-        font-weight: bold !important;
-    }
-    
-    /* PRIMARY BUTTON (Analyze) */
-    div.stButton > button[kind="primary"] {
-        background-color: #ccff00 !important;
-        color: #000000 !important;
-        border: 4px solid #000000 !important;
-        border-radius: 0px !important;
-        padding: 0.8rem 2.5rem !important;
-        font-weight: 900 !important;
-        font-size: 1.2rem !important;
-        text-transform: uppercase !important;
-        box-shadow: 8px 8px 0px #000000 !important;
-        transition: all 0.1s ease !important;
-        width: 100%;
-    }
-    div.stButton > button[kind="primary"]:hover {
-        transform: translate(2px, 2px) !important;
-        box-shadow: 6px 6px 0px #000000 !important;
-    }
-    div.stButton > button[kind="primary"]:active {
-        transform: translate(8px, 8px) !important;
-        box-shadow: 0px 0px 0px #000000 !important;
-    }
-    
-    /* SECONDARY BUTTON (Cycle Test Data / Download) */
-    div.stButton > button[kind="secondary"] {
-        background-color: #ffffff !important;
-        color: #000000 !important;
-        border: 3px solid #000000 !important;
-        border-radius: 0px !important;
-        padding: 0.4rem 1rem !important;
-        font-weight: 900 !important;
-        font-size: 0.9rem !important;
-        text-transform: uppercase !important;
-        box-shadow: 4px 4px 0px #000000 !important;
-        transition: all 0.1s ease !important;
-        width: 100%;
-        margin-bottom: 5px;
-    }
-    div.stButton > button[kind="secondary"]:active {
-        transform: translate(4px, 4px) !important;
-        box-shadow: 0px 0px 0px #000000 !important;
-    }
-    
-    /* Brutalist Output Cards */
-    .brutal-card {
-        background-color: #ffffff;
-        padding: 20px;
-        border: 4px solid #000000;
-        box-shadow: 8px 8px 0px #000000;
-        margin-bottom: 25px;
-        height: 100%;
-        color: #000000 !important;
-    }
-    .brutal-header { 
-        padding: 10px 15px; 
-        border-bottom: 4px solid #000000; 
-        margin: -20px -20px 20px -20px; 
-        font-weight: 900 !important;
-        font-size: 1.2rem;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-    }
-    
-    /* Color Badges */
-    .bg-pink { background-color: #ff006e !important; color: #ffffff !important; }
-    .bg-cyan { background-color: #00d9ff !important; color: #000000 !important; }
-    .bg-orange { background-color: #ff9000 !important; color: #000000 !important; }
-    .bg-yellow { background-color: #ffea00 !important; color: #000000 !important; }
-    .badge-critical { background-color: #ff0033; color: #ffffff; padding: 4px 10px; border: 2px solid #000; font-weight: 900; display: inline-block; margin-bottom: 12px; box-shadow: 3px 3px 0px #000; }
-    .badge-moderate { background-color: #ffcc00; color: #000000; padding: 4px 10px; border: 2px solid #000; font-weight: 900; display: inline-block; margin-bottom: 12px; box-shadow: 3px 3px 0px #000; }
-    .badge-secure { background-color: #00cc66; color: #000000; padding: 4px 10px; border: 2px solid #000; font-weight: 900; display: inline-block; margin-bottom: 12px; box-shadow: 3px 3px 0px #000; }
-    
-    /* Sidebar styling */
-    .sidebar-section {
-        border: 3px solid #000000;
-        padding: 15px;
-        margin-bottom: 20px;
-        background-color: #ffffff;
-        box-shadow: 5px 5px 0px #000000;
-        color: #000000 !important;
-        font-size: 0.95rem;
-    }
-    .sidebar-section b, .sidebar-section p, .sidebar-section div {
-        color: #000000 !important;
-    }
-    hr {
-        border-top: 4px solid #000000 !important;
-        opacity: 1 !important;
-    }
-    </style>
-""", unsafe_allow_html=True)
 
-# --- Sidebar: Documentation & Demo Mode Toggle ---
-with st.sidebar:
-    st.write("")
-    
-    # Demo Mode Toggle Section
-    st.markdown("""
-    <div class="sidebar-section" style="background-color: #ccff00;">
-        <div class="brutal-header bg-black" style="color: white !important;">⚡ CONFIG</div>
-    """, unsafe_allow_html=True)
-    demo_mode = st.toggle("ENABLE DEMO MODE", value=True, help="Bypasses API rate limits by using instant local simulation.")
-    st.markdown("</div>", unsafe_allow_html=True)
+@st.cache_resource
+def get_client():
+    key = config.get_api_key()
+    if not key:
+        return None
+    from google import genai
 
-    st.markdown("""
-    <div class="sidebar-section">
-        <div class="brutal-header bg-orange">⚙️ SYSTEM INFO</div>
-        <b>PROJECT:</b> Invoice Intelligence<br>
-        <b>ARCHITECT:</b> Ankit Mohapatra<br>
-        <b>STATUS:</b> Online & Ready<br>
-    </div>
-    """, unsafe_allow_html=True)
+    return genai.Client(api_key=key)
 
-    st.markdown("""
-    <div class="sidebar-section">
-        <div class="brutal-header bg-cyan">🛠️ TECH STACK</div>
-        • <b>Frontend:</b> Streamlit & CSS<br>
-        • <b>Backend:</b> Python<br>
-        • <b>AI Core:</b> Google GenAI SDK<br>
-        • <b>Model:</b> Gemini 3.6 Flash<br>
-        • <b>Paradigm:</b> Multi-Agent System<br>
-    </div>
-    """, unsafe_allow_html=True)
 
-    st.markdown("""
-    <div class="sidebar-section">
-        <div class="brutal-header bg-pink">📖 HOW IT WORKS</div>
-        <b>1. EXTRACTOR NODE</b><br>
-        Parses raw text into strict JSON schema.<br><br>
-        <b>2. AUDITOR NODE</b><br>
-        Scores risk tiers (Critical/Moderate/Secure) & flags compliance gaps.
-    </div>
-    """, unsafe_allow_html=True)
+@st.cache_resource
+def get_pipeline(top_k: int) -> InvoicePipeline:
+    return InvoicePipeline(client=get_client(), top_k=top_k)
 
-# --- Main Dashboard Header ---
-st.markdown("""
-<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 15px;">
-    <div style="font-size: 2.2rem; font-weight: 900; text-transform: uppercase; background-color: #000000; color: #ffffff !important; padding: 10px 18px; border: 3px solid #000000; box-shadow: 5px 5px 0px #ff006e;">
-        PROCUREMENT AUDIT ENGINE
-    </div>
-    <div style="background-color: #ccff00; color: #000000; font-weight: 900; padding: 8px 14px; border: 3px solid #000000; box-shadow: 4px 4px 0px #000000; font-size: 0.95rem;">
-        ● MULTI-AGENT ACTIVE
-    </div>
-</div>
-""", unsafe_allow_html=True)
 
-st.markdown("<p style='font-size: 1.1rem; max-width: 900px; margin-bottom: 25px; background-color: #ffffff; padding: 12px 15px; border: 3px solid #000; box-shadow: 4px 4px 0px #000; color: #000000 !important;'>Drop an unstructured vendor contract or invoice below. The multi-agent pipeline extracts data, scores risk tiers, and flags compliance anomalies.</p>", unsafe_allow_html=True)
-
-col1, col2 = st.columns([1.5, 1])
-
-with col1:
-    invoice_text = st.text_area("RAW DOCUMENT PAYLOAD", height=250, placeholder="PASTE CONTRACT OR INVOICE HERE...")
-    analyze_clicked = st.button("INITIALIZE COMPLIANCE AUDIT", type="primary")
-
-with col2:
-    if st.button("🔄 CYCLE TEST DATA PAYLOADS", type="secondary"):
-        st.session_state.test_idx = (st.session_state.test_idx + 1) % len(test_invoices)
-        
-    current_invoice = test_invoices[st.session_state.test_idx]
-    current_num = st.session_state.test_idx + 1
-
-    st.markdown(f"""
-    <div class="brutal-card">
-        <div class="brutal-header bg-yellow">💡 TEST DATA 0{current_num}</div>
-        <p style='font-size: 0.85rem; color: #000000 !important; font-weight: bold;'>COPY AND PASTE THIS TO TEST THE ENGINE:</p>
-        <pre style="background:#f4f1ea; padding:8px; border:2px solid #000; color:#000000 !important; font-weight: bold; white-space: pre-wrap; font-size: 0.8rem;">{current_invoice}</pre>
-    </div>
-    """, unsafe_allow_html=True)
-
-# --- Execution Logic ---
-if analyze_clicked and invoice_text.strip():
-    st.markdown("<hr>", unsafe_allow_html=True)
-    
-    if demo_mode:
-        # --- DEMO / MOCK MODE (Zero API Usage) ---
-        with st.spinner("RUNNING MOCK MULTI-AGENT PIPELINE (DEMO MODE)..."):
-            time.sleep(0.6)
-            
-            # Generate smart mock responses based on input text
-            if "Global Logistics" in invoice_text or "routing number" in invoice_text.lower():
-                risk_tier = "CRITICAL"
-                audit_text = "[CRITICAL]\n- HIGH FRAUD RISK: Unverified request to change wire routing instructions via text message.\n- Action Required: Validate bank account change via phone callback with official vendor on file.\n- Compliance Violation: Segregation of duties breach."
-                extracted_json = json.dumps({
-                    "vendor_name": "Global Logistics Inc.",
-                    "invoice_date": "August 15, 2026",
-                    "total_due_usd": 145000.00,
-                    "payment_terms": "Net 15",
-                    "flagged_anomalies": ["Routing number change via SMS", "High-value disbursement"]
-                }, indent=2)
-            elif "TechSphere" in invoice_text or "offshore" in invoice_text.lower():
-                risk_tier = "CRITICAL"
-                audit_text = "[CRITICAL]\n- AML / COMPLIANCE WARNING: Remittance address points to an unverified offshore account (#4492).\n- Action Required: Freeze payment pending KYC verification and tax compliance clearance."
-                extracted_json = json.dumps({
-                    "vendor_name": "TechSphere Solutions",
-                    "invoice_id": "TS-881",
-                    "billed_to": "ACME Corp",
-                    "amount_due_usd": 125500.00,
-                    "payment_terms": "Due on Receipt",
-                    "remittance_account": "Offshore #4492"
-                }, indent=2)
-            else:
-                risk_tier = "MODERATE"
-                audit_text = "[MODERATE]\n- TAX COMPLIANCE GAP: Corporate Tax ID (W-9) is currently missing.\n- Net 90 payment terms exceed standard corporate policy limits (Net 30 max)."
-                extracted_json = json.dumps({
-                    "vendor_name": "Apex Marketing LLC",
-                    "invoice_date": "August 10, 2026",
-                    "total_due_usd": 45000.00,
-                    "payment_terms": "Net 90",
-                    "tax_id_status": "Pending W-9 submission"
-                }, indent=2)
-                
-        formatted_audit_html = audit_text.replace('\n', '<br>')
-        
+def show_api_error(e: ClientError) -> None:
+    if e.code == 429:
+        st.error("🚨 Gemini rate limit (429). Switch to OFFLINE mode in the sidebar to keep testing.")
     else:
-        # --- LIVE API MODE ---
-        try:
-            with st.spinner("EXECUTING LIVE MULTI-AGENT PIPELINE..."):
-                extractor_prompt = f"Extract Vendor Name, Total Amount, Date, Terms, and Important Notes. Output ONLY a valid JSON object. Text: {invoice_text}"
-                extracted_response = client.models.generate_content(model='gemini-3.6-flash', contents=extractor_prompt)
-                extracted_json = extracted_response.text.strip()
-                time.sleep(0.5) 
-                
-                analyst_prompt = f"""
-                Review this JSON. First line MUST be exactly one of these tags: [CRITICAL], [MODERATE], or [SECURE]. 
-                Followed by short bullet points detailing financial risks or compliance status.
-                JSON Data: {extracted_json}
-                """
-                raw_analysis_response = client.models.generate_content(model='gemini-3.6-flash', contents=analyst_prompt)
-                raw_analysis = raw_analysis_response.text.strip()
-                
-                risk_tier = extract_risk_tier(raw_analysis)
-                audit_text = raw_analysis
+        st.error(f"🚨 Gemini API error ({e.code}): {e.message}")
 
-                for tier in ("CRITICAL", "SECURE", "MODERATE"):
-                    audit_text = audit_text.replace(f"[{tier}]", "").strip()
 
-            formatted_audit_html = audit_text.replace('\n', '<br>')
-            
-        except ClientError as e:
-            if e.code == 429:
-                st.error("🚨 **API Rate Limit Exceeded (429)**: Free tier limit reached. Switch **ENABLE DEMO MODE** on in the sidebar to continue testing instantly without limits!")
+def html_block(markup: str) -> None:
+    # Strip indentation so Streamlit's markdown pass doesn't render nested HTML as a code block.
+    st.markdown(re.sub(r"\n\s+", "\n", markup.strip()), unsafe_allow_html=True)
+
+
+SAMPLES = load_dataset()
+SAMPLE_LABELS = {s["id"]: s["id"].replace("-", " ").upper() for s in SAMPLES}
+st.markdown(f"<style>{(config.PACKAGE_DIR / 'ui' / 'theme.css').read_text()}</style>", unsafe_allow_html=True)
+client = get_client()
+
+# --- Sidebar -----------------------------------------------------------------------
+with st.sidebar:
+    html_block('<div class="side-card"><div class="brutal-header bg-lime">⚡ ENGINE</div>'
+               "Pick how every tab runs.</div>")
+    mode_label = st.radio(
+        "Execution mode", ["OFFLINE · deterministic", "LIVE · Gemini"], index=0,
+        help="Offline: regex extractor + BM25 + rule engine. Free, instant, no key. "
+             "Live: Gemini structured extraction, hybrid RAG, grounded LLM auditor (spends API quota).",
+    )
+    mode = "live" if mode_label.startswith("LIVE") else "offline"
+    live_blocked = mode == "live" and client is None
+    if live_blocked:
+        st.error("Set GOOGLE_API_KEY in .env to enable live mode.")
+    top_k = st.slider("Policies retrieved (top-k)", 2, 8, 4)
+    pipeline = get_pipeline(top_k)
+
+    html_block(f"""
+    <div class="side-card"><div class="brutal-header bg-cyan">🧠 GENAI STACK</div>
+    <b>LLM:</b> {esc(config.GENERATION_MODEL)}<br>
+    <b>Embeddings:</b> {esc(config.EMBEDDING_MODEL)} ({config.EMBEDDING_DIM}d)<br>
+    <b>Retrieval:</b> BM25 + dense · RRF<br>
+    <b>Output:</b> Pydantic response_schema<br>
+    <b>Knowledge base:</b> {len(pipeline.chunks)} policy chunks<br>
+    <b>Evals:</b> {len(SAMPLES)} labeled invoices
+    </div>
+    <div class="side-card"><div class="brutal-header bg-orange">⚙️ PROJECT</div>
+    <b>ARCHITECT:</b> Ankit Mohapatra<br>
+    <b>REPO:</b> iamsoankit/invoice-intelligence
+    </div>""")
+
+# --- Header ------------------------------------------------------------------------
+mode_pill = f"LIVE · {config.GENERATION_MODEL.upper()}" if mode == "live" else "OFFLINE ENGINE"
+html_block(f"""
+<div class="hero"><div class="title-block"><span>PROCUREMENT AUDIT ENGINE</span></div></div>
+<div class="subtitle">AI accounts-payable auditor: extracts invoices into a typed schema, retrieves the relevant
+company policy with RAG, and flags fraud &amp; compliance risk with cited evidence.</div>
+<div style="margin-bottom:14px">
+<span class="pill bg-lime">● {esc(mode_pill)}</span>
+<span class="pill bg-cyan">{"HYBRID" if mode == "live" else "BM25"} RAG · {len(pipeline.chunks)} POLICIES</span>
+<span class="pill bg-yellow">STRUCTURED OUTPUT</span>
+<span class="pill bg-pink">PROMPT-INJECTION GUARD</span>
+<span class="pill bg-white">EVAL-GATED CI</span>
+</div>""")
+
+tab_audit, tab_batch, tab_qa, tab_eval, tab_arch = st.tabs(
+    ["🔍 AUDIT", "🗂️ BATCH", "💬 POLICY Q&A", "📊 EVALS", "🏗️ ARCHITECTURE"])
+
+
+# === AUDIT =========================================================================
+def load_sample():
+    sample = next(s for s in SAMPLES if s["id"] == st.session_state.sample_id)
+    st.session_state.invoice_text = sample["document"]
+
+
+def render_result(result: PipelineResult) -> None:
+    audit = result.audit
+    tier = audit.risk_tier.value
+    action, action_text = ACTION_TEXT[tier]
+
+    html_block(f"""<div class="verdict tier-{tier}"><div class="action">{action}</div>
+    <div class="text">{esc(audit.summary)}<br>{action_text}</div></div>""")
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        html_block(f"""<div class="kpi tier-{tier}"><div class="label">RISK TIER</div>
+        <div class="value">{tier}</div><div class="scorebar"><div style="width:{audit.risk_score}%"></div></div>
+        <div class="label" style="margin-top:4px">SCORE {audit.risk_score}/100</div></div>""")
+    with k2:
+        html_block(f"""<div class="kpi bg-yellow"><div class="label">FINDINGS</div>
+        <div class="value">{len(audit.findings)}</div>
+        <div class="label">{sum(f.source == "rule" for f in audit.findings)} RULE ·
+        {sum(f.source == "llm" for f in audit.findings)} LLM</div></div>""")
+    with k3:
+        html_block(f"""<div class="kpi bg-cyan"><div class="label">LATENCY</div>
+        <div class="value">{result.total_latency_ms:,.1f} ms</div>
+        <div class="label">{len(result.trace)} PIPELINE STEPS</div></div>""")
+    with k4:
+        html_block(f"""<div class="kpi bg-lime"><div class="label">TOKENS</div>
+        <div class="value">{result.total_tokens:,}</div>
+        <div class="label">{result.mode.upper()} MODE</div></div>""")
+
+    st.write("")
+    t_find, t_json, t_rag, t_trace = st.tabs(
+        ["🚩 FINDINGS", "📦 EXTRACTED JSON", "📚 RETRIEVED POLICIES", "🧭 PIPELINE TRACE"])
+
+    with t_find:
+        if not audit.findings:
+            html_block('<div class="finding sev-LOW"><div class="head">✅ No policy violations found</div></div>')
+        for f in audit.findings:
+            chips = "".join(f'<span class="chip">{esc(p)}</span>' for p in f.policy_ids)
+            html_block(f"""<div class="finding sev-{f.severity.value}">
+            <div class="head"><span>{esc(f.title)}</span>
+            <span><span class="chip sev">{f.severity.value}</span>
+            <span class="chip src-{esc(f.source)}">{esc(f.source.upper())}</span></span></div>
+            <div class="quote">“{esc(f.evidence)}”</div>
+            <div>{chips} <b>▸ ACTION:</b> {esc(f.recommendation)}</div></div>""")
+
+    with t_json:
+        payload = result.extraction.model_dump()
+        st.json(payload)
+        flat = {k: "; ".join(v) if isinstance(v, list) else v for k, v in payload.items()}
+        report = {"extraction": payload, "audit": audit.model_dump(mode="json"),
+                  "retrieved_policies": [r.chunk.id for r in result.retrieved]}
+        d1, d2, d3 = st.columns(3)
+        d1.download_button("📥 JSON", json.dumps(payload, indent=2), "invoice_payload.json", "application/json")
+        d2.download_button("📥 CSV", json_to_csv(json.dumps(flat)), "invoice_payload.csv", "text/csv")
+        d3.download_button("📥 FULL AUDIT", json.dumps(report, indent=2), "invoice_audit.json", "application/json")
+
+    with t_rag:
+        st.caption("Policy chunks placed in the auditor's context. "
+                   "`guardrail` = force-included because a rule cited it.")
+        for r in result.retrieved:
+            html_block(f"""<div class="finding sev-LOW"><div class="head">
+            <span>[{esc(r.chunk.id)}] {esc(r.chunk.title)}</span>
+            <span><span class="chip sev">{esc(r.retriever)}</span><span class="chip">score {r.score:.4f}</span></span></div>
+            <div style="font-size:.87rem;margin-top:6px">{esc(r.chunk.text)}</div></div>""")
+
+    with t_trace:
+        st.dataframe(pd.DataFrame([s.model_dump() for s in result.trace]), hide_index=True, width="stretch")
+
+
+with tab_audit:
+    st.session_state.setdefault("invoice_text", "")
+    col_in, col_side = st.columns([1.55, 1], gap="large")
+    with col_in:
+        src_text, src_file = st.tabs(["📝 PASTE TEXT", "📎 UPLOAD PDF / IMAGE"])
+        with src_text:
+            st.text_area("RAW DOCUMENT PAYLOAD", key="invoice_text", height=250,
+                         placeholder="PASTE AN INVOICE OR CONTRACT HERE…")
+        with src_file:
+            upload = st.file_uploader("Invoice file", type=["pdf", "png", "jpg", "jpeg", "webp", "txt"],
+                                      help="PDFs and images are read natively by Gemini (multimodal) in live mode.")
+            if upload is not None and upload.type != "text/plain" and mode == "offline":
+                st.warning("PDF / image analysis needs LIVE mode. Text files work in both modes.")
+        run_clicked = st.button("RUN COMPLIANCE AUDIT", type="primary", disabled=live_blocked)
+
+    with col_side:
+        with st.container(border=True):
+            html_block('<div class="brutal-header bg-yellow" style="margin:-16px -16px 12px -16px">'
+                       "💡 TEST INVOICES</div>")
+            st.selectbox("Scenario", list(SAMPLE_LABELS), format_func=SAMPLE_LABELS.get, key="sample_id")
+            st.button("⤵ LOAD INTO EDITOR", on_click=load_sample)
+            preview = next(s for s in SAMPLES if s["id"] == st.session_state.sample_id)
+            # Streamlit's markdown pass collapses newlines inside raw HTML, so use explicit <br>.
+            html_block(f'<div class="doc">{esc(preview["document"]).replace(chr(10), "<br>")}</div>')
+
+    if run_clicked:
+        text, file_bytes, mime = st.session_state.invoice_text.strip(), None, None
+        if upload is not None:
+            if upload.type == "text/plain":
+                text = upload.getvalue().decode("utf-8", errors="replace")
             else:
-                st.error(f"🚨 **API Error ({e.code})**: {e.message}")
-            st.stop()
-        except Exception as ex:
-            st.error(f"🚨 **An unexpected error occurred:** {str(ex)}")
-            st.stop()
+                file_bytes, mime = upload.getvalue(), upload.type
+        if not text and file_bytes is None:
+            st.warning("Paste an invoice, load a test invoice, or upload a file first.")
+        else:
+            try:
+                with st.spinner(f"RUNNING {mode.upper()} PIPELINE…"):
+                    st.session_state.result = pipeline.run(text, file_bytes, mime, mode=mode)
+            except ClientError as e:
+                st.session_state.pop("result", None)
+                show_api_error(e)
+            except ValueError as e:
+                st.session_state.pop("result", None)
+                st.error(f"🚨 {e}")
 
-    # --- Render Results ---
-    res1, res2 = st.columns(2)
-    
-    with res1:
-        badge_class = "badge-moderate"
-        if risk_tier == "CRITICAL": badge_class = "badge-critical"
-        elif risk_tier == "SECURE": badge_class = "badge-secure"
-        
-        st.markdown(f"""
-        <div class="brutal-card">
-            <div class="brutal-header bg-pink">⚠️ RISK AUDIT & SCORING</div>
-            <div class="{badge_class}">RISK TIER: {risk_tier}</div>
-            <div style="font-size: 1.05rem; line-height: 1.6; color: #000000 !important; font-weight: bold;">
-                {formatted_audit_html}
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-    with res2:
-        st.markdown(f"""
-        <div class="brutal-card">
-            <div class="brutal-header bg-cyan">📦 JSON PAYLOAD</div>
-            <pre style="background:#f4f1ea; color:#000000 !important; font-weight:bold; border: 3px solid #000; padding: 15px; margin-bottom: 15px;"><code>{extracted_json}</code></pre>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Add Export Download Buttons below JSON card
+    if "result" in st.session_state:
+        render_result(st.session_state.result)
+
+
+# === BATCH =========================================================================
+with tab_batch:
+    st.markdown("Audit a whole stack of invoices and get a pay / review / hold queue. "
+                "Text files work offline; PDFs and images need LIVE mode.")
+    b1, b2 = st.columns([1.6, 1], gap="large")
+    with b1:
+        batch_files = st.file_uploader("Invoices", accept_multiple_files=True,
+                                       type=["txt", "pdf", "png", "jpg", "jpeg", "webp"], key="batch_files")
+    with b2:
+        st.write("")
+        run_batch = st.button("▶ AUDIT UPLOADED FILES", type="primary", disabled=live_blocked or not batch_files)
+        run_samples = st.button(f"▶ AUDIT ALL {len(SAMPLES)} TEST INVOICES", disabled=live_blocked)
+
+    if run_batch or run_samples:
+        jobs = [(s["id"], s["document"], None, None) for s in SAMPLES] if run_samples else [
+            (f.name, f.getvalue().decode("utf-8", errors="replace"), None, None) if f.type == "text/plain"
+            else (f.name, "", f.getvalue(), f.type) for f in batch_files]
+        done, errors = [], []
+        progress = st.progress(0.0, text="Auditing…")
+        for i, (name, text, data, mime) in enumerate(jobs, start=1):
+            try:
+                done.append((name, pipeline.run(text, data, mime, mode=mode)))
+            except ClientError as e:
+                show_api_error(e)
+                break
+            except ValueError as e:
+                errors.append(f"{name}: {e}")
+            progress.progress(i / len(jobs), text=f"Audited {i}/{len(jobs)}")
+        progress.empty()
+        for err in errors:
+            st.warning(err)
+        st.session_state.batch_rows = portfolio_rows(done)
+
+    rows = st.session_state.get("batch_rows")
+    if rows:
+        summary = portfolio_summary(rows)
+        tiers = summary["tiers"]
+        held_label = " · ".join(f"{ccy} {amt:,.0f}" for ccy, amt in summary["amount_on_hold"].items()) or "NOTHING"
+        held_label += " BLOCKED"
+        c = st.columns(4)
+        cards = [
+            ("DOCUMENTS", summary["documents"], "bg-white", "AUDITED"),
+            ("ON HOLD", tiers["CRITICAL"], "tier-CRITICAL", held_label),
+            ("NEEDS REVIEW", tiers["MODERATE"], "tier-MODERATE", "COMPLIANCE GAPS"),
+            ("CLEAR TO PAY", tiers["SECURE"], "tier-SECURE", "CLEAN"),
+        ]
+        for col, (label, value, cls, foot) in zip(c, cards, strict=True):
+            with col:
+                html_block(f'<div class="kpi {cls}"><div class="label">{label}</div>'
+                           f'<div class="value">{value}</div><div class="label">{foot}</div></div>')
+        st.write("")
+
+        g1, g2 = st.columns(2, gap="large")
+        tier_df = pd.DataFrame([{"tier": t, "count": n} for t, n in tiers.items()])
+        bars = alt.Chart(tier_df).mark_bar(stroke="#000", strokeWidth=3).encode(
+            x=alt.X("tier:N", sort=list(TIER_COLORS), title=None, axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("count:Q", title="invoices", axis=alt.Axis(tickMinStep=1)),
+            color=alt.Color("tier:N", scale=alt.Scale(domain=list(TIER_COLORS), range=list(TIER_COLORS.values())),
+                            legend=None),
+        ).properties(height=230, title="RISK DISTRIBUTION")
+        g1.altair_chart(bars, width="stretch")
+        if summary["top_policies"]:
+            pol_df = pd.DataFrame(summary["top_policies"], columns=["policy", "hits"])
+            pol = alt.Chart(pol_df).mark_bar(stroke="#000", strokeWidth=3, color="#00d9ff").encode(
+                y=alt.Y("policy:N", sort="-x", title=None),
+                x=alt.X("hits:Q", title="findings", axis=alt.Axis(tickMinStep=1)),
+            ).properties(height=230, title="MOST-VIOLATED POLICIES")
+            g2.altair_chart(pol, width="stretch")
+
+        df = pd.DataFrame(rows)
+        st.dataframe(
+            df, hide_index=True, width="stretch",
+            column_config={
+                "score": st.column_config.ProgressColumn("score", min_value=0, max_value=100, format="%d"),
+                "amount": st.column_config.NumberColumn("amount", format="%.2f"),
+            },
+        )
+        st.download_button("📥 DOWNLOAD PAYMENT QUEUE (CSV)", df.to_csv(index=False), "payment_queue.csv", "text/csv")
+
+
+# === POLICY Q&A ====================================================================
+def set_question(q: str) -> None:
+    st.session_state.qa_question = q
+
+
+with tab_qa:
+    st.markdown("Ask the AP policy anything. Answers come **only** from retrieved policy chunks and cite them. "
+                "Offline mode returns the best-matching policy sentences; LIVE mode has Gemini compose the answer.")
+    q_cols = st.columns(len(SUGGESTED_QUESTIONS))
+    for col, q in zip(q_cols, SUGGESTED_QUESTIONS, strict=True):
+        col.button(q, on_click=set_question, args=(q,), key=f"sq-{q}")
+    st.session_state.setdefault("qa_question", "")
+    st.text_input("YOUR QUESTION", key="qa_question", placeholder="e.g. What happens if a vendor asks for Net 90?")
+    ask = st.button("ASK THE POLICY", type="primary", disabled=live_blocked)
+
+    if ask and st.session_state.qa_question.strip():
         try:
-            parsed_json = json.loads(extracted_json)
-            json_string = json.dumps(parsed_json, indent=2)
-            
-            csv_string = json_to_csv(extracted_json)
-            
-            d_col1, d_col2 = st.columns(2)
-            with d_col1:
-                st.download_button(
-                    label="📥 Download JSON",
-                    data=json_string,
-                    file_name="invoice_payload.json",
-                    mime="application/json",
-                    type="secondary"
-                )
-            with d_col2:
-                st.download_button(
-                    label="📥 Download CSV",
-                    data=csv_string,
-                    file_name="invoice_payload.csv",
-                    mime="text/csv",
-                    type="secondary"
-                )
-        except Exception:
-            st.download_button(
-                label="📥 Download Raw Payload",
-                data=extracted_json,
-                file_name="invoice_payload.json",
-                mime="application/json",
-                type="secondary"
-            )
+            with st.spinner("Retrieving and answering…"):
+                answer, retrieved, step = pipeline.ask(st.session_state.qa_question.strip(), mode=mode)
+            st.session_state.setdefault("qa_history", []).insert(
+                0, (st.session_state.qa_question.strip(), answer, retrieved, step))
+        except ClientError as e:
+            show_api_error(e)
+
+    for question, answer, retrieved, step in st.session_state.get("qa_history", [])[:5]:
+        cited = re.sub(r"\[([A-Z]+-\d+)\]", r'<span class="cite">\1</span>', esc(answer.answer))
+        badge = "" if answer.grounded else '<span class="chip" style="background:#ff9000">NOT IN POLICY</span>'
+        html_block(f'<div class="question">Q ▸ {esc(question)}</div>'
+                   f'<div class="answer">{badge}{cited}</div>')
+        with st.expander(f"Sources · {step.detail} · {step.latency_ms:.1f} ms · "
+                         f"{step.input_tokens + step.output_tokens} tokens", expanded=False):
+            for r in retrieved:
+                mark = "✅" if r.chunk.id in answer.cited_ids else "▫️"
+                st.markdown(f"{mark} **[{r.chunk.id}] {r.chunk.title}** · score `{r.score:.4f}`  \n{r.chunk.text}")
+
+
+# === EVALS =========================================================================
+with tab_eval:
+    st.markdown(f"Score the pipeline on **{len(SAMPLES)} labeled invoices**: risk-tier accuracy, field-level "
+                "extraction accuracy, and policy-citation precision / recall. The same harness gates CI "
+                "(`python -m evals.run_eval`). LIVE mode spends Gemini tokens.")
+    if st.button(f"▶ RUN EVAL ({mode.upper()})", type="primary", disabled=live_blocked):
+        try:
+            with st.spinner("Evaluating…"):
+                scores = [score_case(c, pipeline.run(c["document"], mode=mode)) for c in SAMPLES]
+            st.session_state.eval = (mode, scores, summarize(scores))
+        except ClientError as e:
+            show_api_error(e)
+
+    if "eval" in st.session_state:
+        eval_mode, scores, summary = st.session_state.eval
+        st.caption(f"Last run: {eval_mode.upper()} mode")
+        m = st.columns(5)
+        m[0].metric("Tier accuracy", f"{summary['tier_accuracy']:.0%}")
+        m[1].metric("Field accuracy", f"{summary['field_accuracy']:.0%}")
+        m[2].metric("Citation precision", f"{summary['policy_precision']:.0%}")
+        m[3].metric("Citation recall", f"{summary['policy_recall']:.0%}")
+        m[4].metric("Avg latency", f"{summary['avg_latency_ms']:.1f} ms")
+        st.dataframe(pd.DataFrame([{
+            "case": s.id, "expected": s.expected_tier, "predicted": s.predicted_tier,
+            "tier ✓": s.tier_correct, "fields": f"{s.field_hits}/{s.field_total}",
+            "missed fields": ", ".join(s.field_misses), "citations TP/FP/FN": f"{s.policy_tp}/{s.policy_fp}/{s.policy_fn}",
+            "latency ms": round(s.latency_ms, 1), "tokens": s.tokens,
+        } for s in scores]), hide_index=True, width="stretch")
+    with st.expander("View the labeled dataset"):
+        for case in SAMPLES:
+            exp = case["expected"]
+            st.markdown(f"**{case['id']}** → `{exp['risk_tier']}` · cites {', '.join(exp['policy_ids']) or '—'}")
+
+
+# === ARCHITECTURE ==================================================================
+with tab_arch:
+    html_block("""
+    <div class="arch">
+    <div class="node bg-yellow"><div class="n">1 · EXTRACTOR</div><div class="d">Gemini with Pydantic
+    <code>response_schema</code>. Reads text, PDF or image natively. Invoice wrapped as untrusted data.</div></div>
+    <div class="arrow">→</div>
+    <div class="node bg-pink"><div class="n">2 · GUARDRAILS</div><div class="d">Deterministic rules for BEC,
+    bank changes, offshore accounts, missing W-9, duplicates and prompt injection.</div></div>
+    <div class="arrow">→</div>
+    <div class="node bg-cyan"><div class="n">3 · RETRIEVER</div><div class="d">BM25 + gemini-embedding-2 dense
+    search, fused with Reciprocal Rank Fusion. Rule-cited policies always included.</div></div>
+    <div class="arrow">→</div>
+    <div class="node bg-lime"><div class="n">4 · AUDITOR</div><div class="d">Gemini must cite retrieved policy
+    IDs; invented citations are stripped. Rule findings act as a risk floor.</div></div>
+    </div>""")
+    a1, a2 = st.columns([1.2, 1], gap="large")
+    with a1:
+        st.markdown("""
+| GenAI concept | Where it lives |
+|---|---|
+| Structured output (`response_schema`) | `invoice_intelligence/schemas.py`, `llm.py` |
+| Multimodal extraction (`Part.from_bytes`) | `llm.py` |
+| Chunking, BM25, dense embeddings, RRF, index cache | `retrieval.py` |
+| Grounded answers with citation filtering | `llm.py`, `qa.py` |
+| Prompt-injection defence | `llm.py` system prompts + rule `SEC-01` |
+| Guardrails as a risk floor | `rules.py` → `merge_audits` |
+| Tracing (latency + tokens per step) | `pipeline.py` |
+| Offline evals + CI regression gate | `evaluation.py`, `evals/`, `.github/workflows/ci.yml` |
+| Live evals against Gemini | `.github/workflows/live-eval.yml` |
+""")
+    with a2:
+        st.markdown(f"**Knowledge base — {len(pipeline.chunks)} policy chunks**")
+        for chunk in pipeline.chunks:
+            with st.expander(f"[{chunk.id}] {chunk.title}"):
+                st.write(chunk.text)
