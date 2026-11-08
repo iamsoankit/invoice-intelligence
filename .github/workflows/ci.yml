@@ -17,6 +17,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: ruff check .
       - run: pytest -q
       - name: Offline eval regression gate
         run: python -m evals.run_eval --min-tier-accuracy 1.0

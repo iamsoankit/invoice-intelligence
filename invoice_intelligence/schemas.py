@@ -5,7 +5,6 @@ model is constrained to emit exactly these shapes.
 """
 
 from enum import Enum
-from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -24,16 +23,16 @@ class RiskTier(str, Enum):
 
 
 class InvoiceExtraction(BaseModel):
-    vendor_name: Optional[str] = Field(None, description="Legal name of the vendor issuing the invoice.")
-    invoice_id: Optional[str] = Field(None, description="Invoice number or ID, verbatim.")
-    invoice_date: Optional[str] = Field(None, description="Invoice date normalised to ISO-8601 (YYYY-MM-DD) when possible.")
-    billed_to: Optional[str] = Field(None, description="Customer the invoice is addressed to.")
-    currency: Optional[str] = Field(None, description="ISO-4217 currency code, e.g. USD.")
-    total_amount: Optional[float] = Field(None, description="Total amount due as a number, no symbols.")
-    payment_terms: Optional[str] = Field(None, description="Payment terms verbatim, e.g. 'Net 30' or 'Due on Receipt'.")
-    payment_terms_days: Optional[int] = Field(None, description="Terms converted to days. 'Due on Receipt' = 0.")
+    vendor_name: str | None = Field(None, description="Legal name of the vendor issuing the invoice.")
+    invoice_id: str | None = Field(None, description="Invoice number or ID, verbatim.")
+    invoice_date: str | None = Field(None, description="Invoice date normalised to ISO-8601 (YYYY-MM-DD) when possible.")
+    billed_to: str | None = Field(None, description="Customer the invoice is addressed to.")
+    currency: str | None = Field(None, description="ISO-4217 currency code, e.g. USD.")
+    total_amount: float | None = Field(None, description="Total amount due as a number, no symbols.")
+    payment_terms: str | None = Field(None, description="Payment terms verbatim, e.g. 'Net 30' or 'Due on Receipt'.")
+    payment_terms_days: int | None = Field(None, description="Terms converted to days. 'Due on Receipt' = 0.")
     bank_details_changed: bool = Field(False, description="True if the document announces new or changed bank/remittance details.")
-    remittance_details: Optional[str] = Field(None, description="Any account, routing or remittance details mentioned.")
+    remittance_details: str | None = Field(None, description="Any account, routing or remittance details mentioned.")
     tax_id_provided: bool = Field(False, description="True only if a tax ID / W-9 / VAT number is actually present.")
     notes: list[str] = Field(default_factory=list, description="Other notable statements, warnings or requests, verbatim.")
 

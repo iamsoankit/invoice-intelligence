@@ -8,8 +8,8 @@ rule-detected CRITICAL risk down to SECURE.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from datetime import datetime
-from typing import Iterable, Optional
 
 from . import config
 from .schemas import Finding, InvoiceExtraction, RiskAudit, RiskTier, Severity
@@ -41,7 +41,7 @@ _INJECTION = re.compile(
 _DUPLICATE = re.compile(r"reissued|re-issued|corrected copy|second notice|duplicate", re.I)
 
 
-def _evidence(text: str, pattern: re.Pattern) -> Optional[str]:
+def _evidence(text: str, pattern: re.Pattern) -> str | None:
     match = pattern.search(text)
     if not match:
         return None
@@ -137,7 +137,7 @@ def merge_audits(llm_audit: RiskAudit, rule_findings: list[Finding]) -> RiskAudi
 
 # --- Offline heuristic extractor -------------------------------------------------
 
-def _field(text: str, *labels: str) -> Optional[str]:
+def _field(text: str, *labels: str) -> str | None:
     for label in labels:
         match = re.search(rf"^\s*{label}\s*(?:[:#]\s*)+(.+?)\s*$", text, re.I | re.M)
         if match:
@@ -145,7 +145,7 @@ def _field(text: str, *labels: str) -> Optional[str]:
     return None
 
 
-def _iso_date(value: Optional[str]) -> Optional[str]:
+def _iso_date(value: str | None) -> str | None:
     if not value:
         return None
     cleaned = re.sub(r"\bSept\b", "Sep", value.strip())
@@ -157,7 +157,7 @@ def _iso_date(value: Optional[str]) -> Optional[str]:
     return value
 
 
-def terms_to_days(terms: Optional[str]) -> Optional[int]:
+def terms_to_days(terms: str | None) -> int | None:
     if not terms:
         return None
     lowered = terms.lower()

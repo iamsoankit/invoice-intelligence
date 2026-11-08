@@ -13,8 +13,9 @@ import json
 import math
 import re
 from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Protocol
 
 from . import config
 from .schemas import PolicyChunk, RetrievedChunk
@@ -67,7 +68,7 @@ class BM25Retriever:
     def search(self, query: str, k: int = 4) -> list[RetrievedChunk]:
         terms = tokenize(query)
         scored = []
-        for chunk, doc, length in zip(self.chunks, self.docs, self.doc_len):
+        for chunk, doc, length in zip(self.chunks, self.docs, self.doc_len, strict=True):
             score = 0.0
             for t in terms:
                 tf = doc.get(t, 0)
@@ -81,7 +82,7 @@ class BM25Retriever:
 
 
 def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(y * y for y in b))
     return dot / (na * nb) if na and nb else 0.0

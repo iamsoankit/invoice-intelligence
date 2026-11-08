@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 from google.genai import errors, types
 
@@ -62,8 +61,8 @@ class GeminiAgents:
                     raise
                 time.sleep(1.5 * (attempt + 1))
 
-    def extract(self, text: Optional[str] = None, file_bytes: Optional[bytes] = None,
-                mime_type: Optional[str] = None) -> tuple[InvoiceExtraction, Usage]:
+    def extract(self, text: str | None = None, file_bytes: bytes | None = None,
+                mime_type: str | None = None) -> tuple[InvoiceExtraction, Usage]:
         contents: list = []
         if file_bytes is not None:
             # Multimodal path: Gemini reads the PDF / image natively, no OCR step.

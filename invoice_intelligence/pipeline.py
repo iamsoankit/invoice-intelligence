@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager
-from typing import Optional
 
 from .retrieval import BM25Retriever, EmbeddingRetriever, HybridRetriever, load_policy_chunks
 from .rules import audit_from_findings, heuristic_extract, merge_audits, run_guardrails
@@ -36,7 +35,7 @@ class InvoicePipeline:
         self.top_k = top_k
         self.chunks = load_policy_chunks()
         self.bm25 = BM25Retriever(self.chunks)
-        self._dense: Optional[EmbeddingRetriever] = None
+        self._dense: EmbeddingRetriever | None = None
         self._agents = None
 
     @property
@@ -47,7 +46,7 @@ class InvoicePipeline:
             self._agents = GeminiAgents(self.client)
         return self._agents
 
-    def run(self, document: str = "", file_bytes: Optional[bytes] = None, mime_type: Optional[str] = None,
+    def run(self, document: str = "", file_bytes: bytes | None = None, mime_type: str | None = None,
             mode: str = "offline") -> PipelineResult:
         if mode == "live" and self.client is None:
             raise ValueError("Live mode needs a Gemini client (set GOOGLE_API_KEY).")
