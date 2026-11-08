@@ -32,11 +32,10 @@ div.stButton > button:disabled { opacity: .45; }
 [data-testid="stDataFrame"] { border: 3px solid #000; box-shadow: 4px 4px 0 #000; }
 
 /* Tabs: top-level nav gets big chunky tabs, nested tabs are smaller. */
-.stTabs [data-baseweb="tab-list"] { gap: 8px; flex-wrap: wrap; }
-.stTabs [data-baseweb="tab"] { border: 3px solid #000; background: #fff; padding: 6px 14px; font-weight: 900; height: auto; }
-.stTabs [data-baseweb="tab"] p { font-weight: 900 !important; font-size: .95rem; }
-.stTabs [aria-selected="true"] { background: #ccff00 !important; box-shadow: 4px 4px 0 #000; }
-.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] { display: none; }
+[role="tablist"] { gap: 8px; flex-wrap: wrap; border-bottom: none !important; }
+[data-testid="stTab"] { border: 3px solid #000 !important; background: #fff; padding: 6px 14px !important; font-weight: 900; height: auto; margin-right: 0 !important; }
+[data-testid="stTab"] p { font-weight: 900 !important; font-size: .95rem; }
+[data-testid="stTab"][aria-selected="true"] { background: #ccff00 !important; box-shadow: 4px 4px 0 #000; }
 
 .brutal-card { background: #fff; padding: 16px 18px; border: 4px solid #000; box-shadow: 7px 7px 0 #000;
     margin-bottom: 20px; color: #000 !important; }
@@ -99,3 +98,4 @@ div.stButton > button:disabled { opacity: .45; }
 .arch .node .n { font-weight: 900; font-size: 1rem; margin-bottom: 6px; }
 .arch .node .d { font-size: .82rem; font-weight: 700; }
 .arch .arrow { align-self: center; font-size: 1.8rem; font-weight: 900; }
+[data-testid="stTab"]::after, [role="tablist"] > div:not([data-testid="stTab"]) { display: none !important; }

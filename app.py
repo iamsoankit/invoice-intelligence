@@ -272,10 +272,12 @@ with tab_batch:
     if rows:
         summary = portfolio_summary(rows)
         tiers = summary["tiers"]
+        held_label = " · ".join(f"{ccy} {amt:,.0f}" for ccy, amt in summary["amount_on_hold"].items()) or "NOTHING"
+        held_label += " BLOCKED"
         c = st.columns(4)
         cards = [
             ("DOCUMENTS", summary["documents"], "bg-white", "AUDITED"),
-            ("ON HOLD", tiers["CRITICAL"], "tier-CRITICAL", f"{summary['amount_on_hold']:,.0f} BLOCKED"),
+            ("ON HOLD", tiers["CRITICAL"], "tier-CRITICAL", held_label),
             ("NEEDS REVIEW", tiers["MODERATE"], "tier-MODERATE", "COMPLIANCE GAPS"),
             ("CLEAR TO PAY", tiers["SECURE"], "tier-SECURE", "CLEAN"),
         ]
@@ -288,7 +290,7 @@ with tab_batch:
         g1, g2 = st.columns(2, gap="large")
         tier_df = pd.DataFrame([{"tier": t, "count": n} for t, n in tiers.items()])
         bars = alt.Chart(tier_df).mark_bar(stroke="#000", strokeWidth=3).encode(
-            x=alt.X("tier:N", sort=list(TIER_COLORS), title=None),
+            x=alt.X("tier:N", sort=list(TIER_COLORS), title=None, axis=alt.Axis(labelAngle=0)),
             y=alt.Y("count:Q", title="invoices", axis=alt.Axis(tickMinStep=1)),
             color=alt.Color("tier:N", scale=alt.Scale(domain=list(TIER_COLORS), range=list(TIER_COLORS.values())),
                             legend=None),

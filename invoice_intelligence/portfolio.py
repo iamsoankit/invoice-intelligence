@@ -29,12 +29,15 @@ def portfolio_rows(named_results: list[tuple[str, PipelineResult]]) -> list[dict
 
 def portfolio_summary(rows: list[dict]) -> dict:
     tiers = Counter(row["tier"] for row in rows)
-    held = [row["amount"] or 0 for row in rows if row["action"] == "HOLD"]
+    held: Counter = Counter()
+    for row in rows:
+        if row["action"] == "HOLD" and row["amount"]:
+            held[row["currency"] or "N/A"] += row["amount"]
     policy_hits = Counter(p.strip() for row in rows for p in row["policies"].split(",") if p.strip())
     return {
         "documents": len(rows),
         "tiers": {t.value: tiers.get(t.value, 0) for t in RiskTier},
-        "amount_on_hold": sum(held),
-        "amount_total": sum(row["amount"] or 0 for row in rows),
+        # Keyed by currency: amounts in different currencies are never summed together.
+        "amount_on_hold": dict(held.most_common()),
         "top_policies": policy_hits.most_common(5),
     }

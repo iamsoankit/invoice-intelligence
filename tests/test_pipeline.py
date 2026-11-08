@@ -201,4 +201,4 @@ def test_portfolio_summary_from_samples():
     assert summary["documents"] == len(CASES)
     assert summary["tiers"] == {"SECURE": 2, "MODERATE": 2, "CRITICAL": 4}
     assert rows[0]["action"] == "HOLD" and rows[-1]["action"] == "PAY"
-    assert summary["amount_on_hold"] == 145000 + 125500 + 18400 + 62300
+    assert summary["amount_on_hold"] == {"USD": 145000 + 125500 + 18400, "EUR": 62300}
