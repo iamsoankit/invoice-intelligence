@@ -1,381 +1,307 @@
-import os
-import time
+import html
 import json
+
+import pandas as pd
 import streamlit as st
-from google import genai
-from google.genai.errors import ClientError
 from dotenv import load_dotenv
-from invoice_intelligence.analysis import extract_risk_tier, json_to_csv
+from google.genai.errors import ClientError
+
+from invoice_intelligence import config
+from invoice_intelligence.analysis import json_to_csv
+from invoice_intelligence.evaluation import load_dataset, score_case, summarize
+from invoice_intelligence.pipeline import InvoicePipeline
+from invoice_intelligence.schemas import PipelineResult
 
 load_dotenv()
 
-# Safely initialize client only if key exists
-api_key = os.environ.get("GOOGLE_API_KEY", "")
-client = genai.Client(api_key=api_key) if api_key else None
+st.set_page_config(page_title="Invoice Intelligence", page_icon="⚡", layout="wide")
 
-st.set_page_config(page_title="Procurement AI", page_icon="⚡", layout="wide")
 
-# --- Manage State for Test Data Cycling ---
-if 'test_idx' not in st.session_state:
-    st.session_state.test_idx = 0
+@st.cache_resource
+def get_client():
+    key = config.get_api_key()
+    if not key:
+        return None
+    from google import genai
 
-test_invoices = [
-    """=== INVOICE DOCUMENT ===
-Vendor: Global Logistics Inc.
-Date: August 15, 2026
-TOTAL DUE: $145,000.00
-Terms: Net 15
+    return genai.Client(api_key=key)
 
-*** IMPORTANT ***
-Our routing number has changed. Do not send to the previous account. New wire instructions will be sent via text message.""",
 
-    """=== INVOICE DOCUMENT ===
-From: TechSphere Solutions
-Invoice ID: TS-881
-Billed To: ACME Corp
-Amount Due: $125,500.00
+@st.cache_resource
+def get_pipeline(top_k: int) -> InvoicePipeline:
+    return InvoicePipeline(client=get_client(), top_k=top_k)
 
-Payment Terms: Due on Receipt.
-WARNING: Remittance address changed to offshore account #4492.""",
 
-    """=== INVOICE DOCUMENT ===
-Vendor: Apex Marketing LLC
-Date: Aug 10, 2026
-Services: General Consulting & Ad-hoc PR
-TOTAL: $45,000.00
-Terms: Net 90
+SAMPLES = load_dataset()
+SAMPLE_LABELS = {s["id"]: s["id"].replace("-", " ").upper() for s in SAMPLES}
+esc = html.escape
 
-Note: Corporate Tax ID (W-9) is currently pending and will be submitted next quarter. Please process payment without it for now."""
-]
-
-# --- Neo-Brutalist Custom CSS ---
+# --- Neo-Brutalist CSS -------------------------------------------------------------
 st.markdown("""
-    <style>
-    /* Absolute White & Background Setup */
-    [data-testid="stAppViewContainer"] { background-color: #f4f1ea !important; }
-    [data-testid="stSidebar"] { background-color: #ffffff !important; border-right: 4px solid #000000 !important; }
-    
-    /* Apply brutalist font globally */
-    h1, h2, h3, p, label, li, b, div { font-family: 'Courier New', Courier, monospace !important; }
-    
-    /* Force default text to black for headings and paragraphs */
-    h1, h2, h3, p, label, li { color: #000000 !important; font-weight: 700 !important; }
-    
-    /* Brutalist Input Area */
-    div[data-baseweb="textarea"] > textarea {
-        background-color: #ffffff !important;
-        color: #000000 !important;
-        border: 4px solid #000000 !important;
-        border-radius: 0px !important;
-        box-shadow: 8px 8px 0px #000000 !important;
-        padding: 15px !important;
-        font-size: 16px !important;
-        font-weight: bold !important;
-    }
-    
-    /* PRIMARY BUTTON (Analyze) */
-    div.stButton > button[kind="primary"] {
-        background-color: #ccff00 !important;
-        color: #000000 !important;
-        border: 4px solid #000000 !important;
-        border-radius: 0px !important;
-        padding: 0.8rem 2.5rem !important;
-        font-weight: 900 !important;
-        font-size: 1.2rem !important;
-        text-transform: uppercase !important;
-        box-shadow: 8px 8px 0px #000000 !important;
-        transition: all 0.1s ease !important;
-        width: 100%;
-    }
-    div.stButton > button[kind="primary"]:hover {
-        transform: translate(2px, 2px) !important;
-        box-shadow: 6px 6px 0px #000000 !important;
-    }
-    div.stButton > button[kind="primary"]:active {
-        transform: translate(8px, 8px) !important;
-        box-shadow: 0px 0px 0px #000000 !important;
-    }
-    
-    /* SECONDARY BUTTON (Cycle Test Data / Download) */
-    div.stButton > button[kind="secondary"] {
-        background-color: #ffffff !important;
-        color: #000000 !important;
-        border: 3px solid #000000 !important;
-        border-radius: 0px !important;
-        padding: 0.4rem 1rem !important;
-        font-weight: 900 !important;
-        font-size: 0.9rem !important;
-        text-transform: uppercase !important;
-        box-shadow: 4px 4px 0px #000000 !important;
-        transition: all 0.1s ease !important;
-        width: 100%;
-        margin-bottom: 5px;
-    }
-    div.stButton > button[kind="secondary"]:active {
-        transform: translate(4px, 4px) !important;
-        box-shadow: 0px 0px 0px #000000 !important;
-    }
-    
-    /* Brutalist Output Cards */
-    .brutal-card {
-        background-color: #ffffff;
-        padding: 20px;
-        border: 4px solid #000000;
-        box-shadow: 8px 8px 0px #000000;
-        margin-bottom: 25px;
-        height: 100%;
-        color: #000000 !important;
-    }
-    .brutal-header { 
-        padding: 10px 15px; 
-        border-bottom: 4px solid #000000; 
-        margin: -20px -20px 20px -20px; 
-        font-weight: 900 !important;
-        font-size: 1.2rem;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-    }
-    
-    /* Color Badges */
-    .bg-pink { background-color: #ff006e !important; color: #ffffff !important; }
-    .bg-cyan { background-color: #00d9ff !important; color: #000000 !important; }
-    .bg-orange { background-color: #ff9000 !important; color: #000000 !important; }
-    .bg-yellow { background-color: #ffea00 !important; color: #000000 !important; }
-    .badge-critical { background-color: #ff0033; color: #ffffff; padding: 4px 10px; border: 2px solid #000; font-weight: 900; display: inline-block; margin-bottom: 12px; box-shadow: 3px 3px 0px #000; }
-    .badge-moderate { background-color: #ffcc00; color: #000000; padding: 4px 10px; border: 2px solid #000; font-weight: 900; display: inline-block; margin-bottom: 12px; box-shadow: 3px 3px 0px #000; }
-    .badge-secure { background-color: #00cc66; color: #000000; padding: 4px 10px; border: 2px solid #000; font-weight: 900; display: inline-block; margin-bottom: 12px; box-shadow: 3px 3px 0px #000; }
-    
-    /* Sidebar styling */
-    .sidebar-section {
-        border: 3px solid #000000;
-        padding: 15px;
-        margin-bottom: 20px;
-        background-color: #ffffff;
-        box-shadow: 5px 5px 0px #000000;
-        color: #000000 !important;
-        font-size: 0.95rem;
-    }
-    .sidebar-section b, .sidebar-section p, .sidebar-section div {
-        color: #000000 !important;
-    }
-    hr {
-        border-top: 4px solid #000000 !important;
-        opacity: 1 !important;
-    }
-    </style>
+<style>
+[data-testid="stAppViewContainer"] { background-color: #f4f1ea !important; }
+[data-testid="stSidebar"] { background-color: #ffffff !important; border-right: 4px solid #000 !important; }
+h1, h2, h3, p, label, li, b, div, code, pre { font-family: 'Courier New', Courier, monospace !important; }
+h1, h2, h3, p, label, li { color: #000 !important; font-weight: 700 !important; }
+
+div[data-baseweb="textarea"] > textarea {
+    background: #fff !important; color: #000 !important; border: 4px solid #000 !important;
+    border-radius: 0 !important; box-shadow: 8px 8px 0 #000 !important; padding: 15px !important;
+    font-size: 15px !important; font-weight: bold !important;
+}
+div.stButton > button, div.stDownloadButton > button {
+    border: 3px solid #000 !important; border-radius: 0 !important; font-weight: 900 !important;
+    text-transform: uppercase !important; box-shadow: 4px 4px 0 #000 !important;
+    transition: all .1s ease !important; width: 100%; color: #000 !important; background: #fff !important;
+}
+div.stButton > button[kind="primary"] {
+    background: #ccff00 !important; border-width: 4px !important; padding: .8rem 2.5rem !important;
+    font-size: 1.15rem !important; box-shadow: 8px 8px 0 #000 !important;
+}
+div.stButton > button:hover, div.stDownloadButton > button:hover { transform: translate(2px,2px); box-shadow: 2px 2px 0 #000 !important; }
+div.stButton > button:active { transform: translate(4px,4px); box-shadow: 0 0 0 #000 !important; }
+
+[data-testid="stVerticalBlockBorderWrapper"] { border: 3px solid #000 !important; border-radius: 0 !important;
+    box-shadow: 5px 5px 0 #000; background: #fff; }
+.stTabs [data-baseweb="tab-list"] { gap: 6px; }
+.stTabs [data-baseweb="tab"] { border: 3px solid #000; background: #fff; padding: 6px 14px; font-weight: 900; }
+.stTabs [aria-selected="true"] { background: #ccff00 !important; box-shadow: 3px 3px 0 #000; }
+.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"] { display: none; }
+
+.brutal-card { background: #fff; padding: 18px; border: 4px solid #000; box-shadow: 8px 8px 0 #000;
+    margin-bottom: 22px; color: #000 !important; }
+.brutal-header { padding: 8px 14px; border-bottom: 4px solid #000; margin: -18px -18px 16px -18px;
+    font-weight: 900 !important; font-size: 1.1rem; text-transform: uppercase; letter-spacing: 1px; }
+.side-card { border: 3px solid #000; padding: 12px; margin-bottom: 18px; background: #fff;
+    box-shadow: 5px 5px 0 #000; font-size: .88rem; color: #000 !important; }
+.side-card .brutal-header { margin: -12px -12px 12px -12px; font-size: .95rem; }
+.bg-pink { background: #ff006e !important; color: #fff !important; }
+.bg-cyan { background: #00d9ff !important; } .bg-orange { background: #ff9000 !important; }
+.bg-yellow { background: #ffea00 !important; } .bg-lime { background: #ccff00 !important; }
+.bg-black { background: #000 !important; color: #fff !important; }
+
+.title-block { display: inline-block; font-size: 2.1rem; font-weight: 900; text-transform: uppercase;
+    background: #000; padding: 10px 18px; box-shadow: 6px 6px 0 #ff006e; }
+.title-block span { color: #fff !important; }
+.pill { display: inline-block; border: 3px solid #000; padding: 4px 10px; margin: 0 8px 8px 0;
+    font-weight: 900; font-size: .8rem; box-shadow: 3px 3px 0 #000; color: #000 !important; }
+
+.kpi { background: #fff; border: 4px solid #000; box-shadow: 6px 6px 0 #000; padding: 12px 14px; height: 100%; }
+.kpi .label { font-size: .75rem; font-weight: 900; letter-spacing: 1px; }
+.kpi .value { font-size: 1.8rem; font-weight: 900; line-height: 1.2; }
+.tier-CRITICAL { background: #ff0033 !important; color: #fff !important; }
+.tier-MODERATE { background: #ffcc00 !important; }
+.tier-SECURE { background: #00cc66 !important; }
+.tier-CRITICAL .label, .tier-CRITICAL .value { color: #fff !important; }
+.scorebar { height: 14px; border: 3px solid #000; background: #fff; margin-top: 6px; }
+.scorebar > div { height: 100%; background: #000; }
+
+.finding { background: #fff; border: 3px solid #000; border-left-width: 14px; padding: 12px 16px;
+    margin-bottom: 14px; box-shadow: 5px 5px 0 #000; }
+.sev-CRITICAL { border-left-color: #ff0033; } .sev-HIGH { border-left-color: #ff9000; }
+.sev-MEDIUM { border-left-color: #ffcc00; } .sev-LOW { border-left-color: #00d9ff; }
+.finding .head { display: flex; justify-content: space-between; gap: 10px; font-weight: 900; font-size: 1.02rem; }
+.finding .quote { background: #f4f1ea; border: 2px dashed #000; padding: 6px 10px; margin: 8px 0; font-size: .88rem; }
+.chip { display: inline-block; border: 2px solid #000; padding: 1px 7px; margin-right: 6px; font-size: .75rem;
+    font-weight: 900; background: #00d9ff; }
+.chip.src-rule { background: #000; color: #fff !important; } .chip.src-llm { background: #ccff00; }
+.chip.sev { background: #fff; }
+.doc { background: #f4f1ea; padding: 10px; border: 2px solid #000; color: #000 !important;
+    white-space: pre-wrap; font-size: .8rem; font-weight: bold; margin: 0; }
+</style>
 """, unsafe_allow_html=True)
 
-# --- Sidebar: Documentation & Demo Mode Toggle ---
+client = get_client()
+
+# --- Sidebar -----------------------------------------------------------------------
 with st.sidebar:
-    st.write("")
-    
-    # Demo Mode Toggle Section
-    st.markdown("""
-    <div class="sidebar-section" style="background-color: #ccff00;">
-        <div class="brutal-header bg-black" style="color: white !important;">⚡ CONFIG</div>
-    """, unsafe_allow_html=True)
-    demo_mode = st.toggle("ENABLE DEMO MODE", value=True, help="Bypasses API rate limits by using instant local simulation.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('<div class="side-card"><div class="brutal-header bg-lime">⚡ ENGINE</div>'
+                "Choose how the pipeline runs.</div>", unsafe_allow_html=True)
+    mode_label = st.radio(
+        "Execution mode",
+        ["OFFLINE · deterministic", "LIVE · Gemini"],
+        index=1 if client else 0,
+        help="Offline: regex extractor + BM25 + rule engine. Free, instant, no key. "
+             "Live: Gemini structured extraction, hybrid RAG, grounded LLM auditor.",
+    )
+    mode = "live" if mode_label.startswith("LIVE") else "offline"
+    if mode == "live" and client is None:
+        st.error("Set GOOGLE_API_KEY in .env to enable live mode.")
+    top_k = st.slider("Policies retrieved (top-k)", 2, 8, 4)
 
-    st.markdown("""
-    <div class="sidebar-section">
-        <div class="brutal-header bg-orange">⚙️ SYSTEM INFO</div>
-        <b>PROJECT:</b> Invoice Intelligence<br>
-        <b>ARCHITECT:</b> Ankit Mohapatra<br>
-        <b>STATUS:</b> Online & Ready<br>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("""
-    <div class="sidebar-section">
-        <div class="brutal-header bg-cyan">🛠️ TECH STACK</div>
-        • <b>Frontend:</b> Streamlit & CSS<br>
-        • <b>Backend:</b> Python<br>
-        • <b>AI Core:</b> Google GenAI SDK<br>
-        • <b>Model:</b> Gemini 3.6 Flash<br>
-        • <b>Paradigm:</b> Multi-Agent System<br>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("""
-    <div class="sidebar-section">
-        <div class="brutal-header bg-pink">📖 HOW IT WORKS</div>
-        <b>1. EXTRACTOR NODE</b><br>
-        Parses raw text into strict JSON schema.<br><br>
-        <b>2. AUDITOR NODE</b><br>
-        Scores risk tiers (Critical/Moderate/Secure) & flags compliance gaps.
-    </div>
-    """, unsafe_allow_html=True)
-
-# --- Main Dashboard Header ---
-st.markdown("""
-<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 15px;">
-    <div style="font-size: 2.2rem; font-weight: 900; text-transform: uppercase; background-color: #000000; color: #ffffff !important; padding: 10px 18px; border: 3px solid #000000; box-shadow: 5px 5px 0px #ff006e;">
-        PROCUREMENT AUDIT ENGINE
-    </div>
-    <div style="background-color: #ccff00; color: #000000; font-weight: 900; padding: 8px 14px; border: 3px solid #000000; box-shadow: 4px 4px 0px #000000; font-size: 0.95rem;">
-        ● MULTI-AGENT ACTIVE
-    </div>
+    kb_size = len(get_pipeline(top_k).chunks)
+    st.markdown(f"""
+<div class="side-card"><div class="brutal-header bg-cyan">🧠 GENAI STACK</div>
+<b>LLM:</b> {esc(config.GENERATION_MODEL)}<br>
+<b>Embeddings:</b> {esc(config.EMBEDDING_MODEL)} ({config.EMBEDDING_DIM}d)<br>
+<b>Retrieval:</b> BM25 + dense · RRF fusion<br>
+<b>Output:</b> Pydantic response_schema<br>
+<b>Knowledge base:</b> {kb_size} policy chunks<br>
+<b>Evals:</b> {len(SAMPLES)} labeled invoices
+</div>
+<div class="side-card"><div class="brutal-header bg-pink">🧭 PIPELINE</div>
+<b>1. EXTRACTOR</b> → text / PDF / image into a typed schema<br>
+<b>2. GUARDRAILS</b> → deterministic fraud &amp; injection rules<br>
+<b>3. RETRIEVER</b> → hybrid search over AP policy<br>
+<b>4. AUDITOR</b> → cites policy IDs; rules act as a risk floor
+</div>
+<div class="side-card"><div class="brutal-header bg-orange">⚙️ PROJECT</div>
+<b>ARCHITECT:</b> Ankit Mohapatra
 </div>
 """, unsafe_allow_html=True)
 
-st.markdown("<p style='font-size: 1.1rem; max-width: 900px; margin-bottom: 25px; background-color: #ffffff; padding: 12px 15px; border: 3px solid #000; box-shadow: 4px 4px 0px #000; color: #000000 !important;'>Drop an unstructured vendor contract or invoice below. The multi-agent pipeline extracts data, scores risk tiers, and flags compliance anomalies.</p>", unsafe_allow_html=True)
+# --- Header ------------------------------------------------------------------------
+retriever_name = "HYBRID RAG" if mode == "live" else "BM25 RAG"
+st.markdown(f"""
+<div style="margin-bottom:14px"><div class="title-block"><span>PROCUREMENT AUDIT ENGINE</span></div></div>
+<div style="margin-bottom:18px">
+  <span class="pill bg-lime">● {"LIVE · " + esc(config.GENERATION_MODEL.upper()) if mode == "live" else "OFFLINE MODE"}</span>
+  <span class="pill bg-cyan">{retriever_name} · {kb_size} POLICIES</span>
+  <span class="pill bg-yellow">STRUCTURED OUTPUT</span>
+  <span class="pill bg-pink" style="color:#fff !important">PROMPT-INJECTION GUARD</span>
+</div>
+""", unsafe_allow_html=True)
 
-col1, col2 = st.columns([1.5, 1])
+if "invoice_text" not in st.session_state:
+    st.session_state.invoice_text = ""
 
-with col1:
-    invoice_text = st.text_area("RAW DOCUMENT PAYLOAD", height=250, placeholder="PASTE CONTRACT OR INVOICE HERE...")
-    analyze_clicked = st.button("INITIALIZE COMPLIANCE AUDIT", type="primary")
 
-with col2:
-    if st.button("🔄 CYCLE TEST DATA PAYLOADS", type="secondary"):
-        st.session_state.test_idx = (st.session_state.test_idx + 1) % len(test_invoices)
-        
-    current_invoice = test_invoices[st.session_state.test_idx]
-    current_num = st.session_state.test_idx + 1
+def load_sample():
+    sample = next(s for s in SAMPLES if s["id"] == st.session_state.sample_id)
+    st.session_state.invoice_text = sample["document"]
 
-    st.markdown(f"""
-    <div class="brutal-card">
-        <div class="brutal-header bg-yellow">💡 TEST DATA 0{current_num}</div>
-        <p style='font-size: 0.85rem; color: #000000 !important; font-weight: bold;'>COPY AND PASTE THIS TO TEST THE ENGINE:</p>
-        <pre style="background:#f4f1ea; padding:8px; border:2px solid #000; color:#000000 !important; font-weight: bold; white-space: pre-wrap; font-size: 0.8rem;">{current_invoice}</pre>
-    </div>
-    """, unsafe_allow_html=True)
 
-# --- Execution Logic ---
-if analyze_clicked and invoice_text.strip():
-    st.markdown("<hr>", unsafe_allow_html=True)
-    
-    if demo_mode:
-        # --- DEMO / MOCK MODE (Zero API Usage) ---
-        with st.spinner("RUNNING MOCK MULTI-AGENT PIPELINE (DEMO MODE)..."):
-            time.sleep(0.6)
-            
-            # Generate smart mock responses based on input text
-            if "Global Logistics" in invoice_text or "routing number" in invoice_text.lower():
-                risk_tier = "CRITICAL"
-                audit_text = "[CRITICAL]\n- HIGH FRAUD RISK: Unverified request to change wire routing instructions via text message.\n- Action Required: Validate bank account change via phone callback with official vendor on file.\n- Compliance Violation: Segregation of duties breach."
-                extracted_json = json.dumps({
-                    "vendor_name": "Global Logistics Inc.",
-                    "invoice_date": "August 15, 2026",
-                    "total_due_usd": 145000.00,
-                    "payment_terms": "Net 15",
-                    "flagged_anomalies": ["Routing number change via SMS", "High-value disbursement"]
-                }, indent=2)
-            elif "TechSphere" in invoice_text or "offshore" in invoice_text.lower():
-                risk_tier = "CRITICAL"
-                audit_text = "[CRITICAL]\n- AML / COMPLIANCE WARNING: Remittance address points to an unverified offshore account (#4492).\n- Action Required: Freeze payment pending KYC verification and tax compliance clearance."
-                extracted_json = json.dumps({
-                    "vendor_name": "TechSphere Solutions",
-                    "invoice_id": "TS-881",
-                    "billed_to": "ACME Corp",
-                    "amount_due_usd": 125500.00,
-                    "payment_terms": "Due on Receipt",
-                    "remittance_account": "Offshore #4492"
-                }, indent=2)
-            else:
-                risk_tier = "MODERATE"
-                audit_text = "[MODERATE]\n- TAX COMPLIANCE GAP: Corporate Tax ID (W-9) is currently missing.\n- Net 90 payment terms exceed standard corporate policy limits (Net 30 max)."
-                extracted_json = json.dumps({
-                    "vendor_name": "Apex Marketing LLC",
-                    "invoice_date": "August 10, 2026",
-                    "total_due_usd": 45000.00,
-                    "payment_terms": "Net 90",
-                    "tax_id_status": "Pending W-9 submission"
-                }, indent=2)
-                
-        formatted_audit_html = audit_text.replace('\n', '<br>')
-        
+col_in, col_side = st.columns([1.55, 1], gap="large")
+
+with col_in:
+    tab_text, tab_file = st.tabs(["📝 PASTE TEXT", "📎 UPLOAD PDF / IMAGE"])
+    with tab_text:
+        st.text_area("RAW DOCUMENT PAYLOAD", key="invoice_text", height=260,
+                     placeholder="PASTE AN INVOICE OR CONTRACT HERE…")
+    with tab_file:
+        upload = st.file_uploader("Invoice file", type=["pdf", "png", "jpg", "jpeg", "webp", "txt"],
+                                  help="PDFs and images are read natively by Gemini (multimodal) in live mode.")
+        if upload is not None and upload.type != "text/plain" and mode == "offline":
+            st.warning("PDF / image analysis needs LIVE mode. Text files work in both modes.")
+    run_clicked = st.button("RUN COMPLIANCE AUDIT", type="primary")
+
+with col_side:
+    with st.container(border=True):
+        st.markdown('<div class="brutal-header bg-yellow" style="margin:-16px -16px 12px -16px">'
+                    "💡 TEST INVOICES</div>", unsafe_allow_html=True)
+        st.selectbox("Scenario", list(SAMPLE_LABELS), format_func=SAMPLE_LABELS.get, key="sample_id")
+        st.button("⤵ LOAD INTO EDITOR", on_click=load_sample)
+        preview = next(s for s in SAMPLES if s["id"] == st.session_state.sample_id)
+        # Streamlit's markdown pass collapses newlines inside raw HTML, so use explicit <br>.
+        preview_html = esc(preview["document"]).replace("\n", "<br>")
+        st.markdown(f'<div class="doc">{preview_html}</div>', unsafe_allow_html=True)
+
+# --- Execution ---------------------------------------------------------------------
+if run_clicked:
+    text, file_bytes, mime = st.session_state.invoice_text.strip(), None, None
+    if upload is not None:
+        if upload.type == "text/plain":
+            text = upload.getvalue().decode("utf-8", errors="replace")
+        else:
+            file_bytes, mime = upload.getvalue(), upload.type
+    if not text and file_bytes is None:
+        st.warning("Paste an invoice, load a test invoice, or upload a file first.")
     else:
-        # --- LIVE API MODE ---
         try:
-            with st.spinner("EXECUTING LIVE MULTI-AGENT PIPELINE..."):
-                extractor_prompt = f"Extract Vendor Name, Total Amount, Date, Terms, and Important Notes. Output ONLY a valid JSON object. Text: {invoice_text}"
-                extracted_response = client.models.generate_content(model='gemini-3.6-flash', contents=extractor_prompt)
-                extracted_json = extracted_response.text.strip()
-                time.sleep(0.5) 
-                
-                analyst_prompt = f"""
-                Review this JSON. First line MUST be exactly one of these tags: [CRITICAL], [MODERATE], or [SECURE]. 
-                Followed by short bullet points detailing financial risks or compliance status.
-                JSON Data: {extracted_json}
-                """
-                raw_analysis_response = client.models.generate_content(model='gemini-3.6-flash', contents=analyst_prompt)
-                raw_analysis = raw_analysis_response.text.strip()
-                
-                risk_tier = extract_risk_tier(raw_analysis)
-                audit_text = raw_analysis
-
-                for tier in ("CRITICAL", "SECURE", "MODERATE"):
-                    audit_text = audit_text.replace(f"[{tier}]", "").strip()
-
-            formatted_audit_html = audit_text.replace('\n', '<br>')
-            
+            with st.spinner(f"RUNNING {mode.upper()} PIPELINE…"):
+                st.session_state.result = get_pipeline(top_k).run(text, file_bytes, mime, mode=mode)
         except ClientError as e:
+            st.session_state.pop("result", None)
             if e.code == 429:
-                st.error("🚨 **API Rate Limit Exceeded (429)**: Free tier limit reached. Switch **ENABLE DEMO MODE** on in the sidebar to continue testing instantly without limits!")
+                st.error("🚨 Gemini rate limit (429). Switch to OFFLINE mode in the sidebar to keep testing.")
             else:
-                st.error(f"🚨 **API Error ({e.code})**: {e.message}")
-            st.stop()
-        except Exception as ex:
-            st.error(f"🚨 **An unexpected error occurred:** {str(ex)}")
-            st.stop()
+                st.error(f"🚨 Gemini API error ({e.code}): {e.message}")
+        except ValueError as e:
+            st.session_state.pop("result", None)
+            st.error(f"🚨 {e}")
 
-    # --- Render Results ---
-    res1, res2 = st.columns(2)
-    
-    with res1:
-        badge_class = "badge-moderate"
-        if risk_tier == "CRITICAL": badge_class = "badge-critical"
-        elif risk_tier == "SECURE": badge_class = "badge-secure"
-        
-        st.markdown(f"""
-        <div class="brutal-card">
-            <div class="brutal-header bg-pink">⚠️ RISK AUDIT & SCORING</div>
-            <div class="{badge_class}">RISK TIER: {risk_tier}</div>
-            <div style="font-size: 1.05rem; line-height: 1.6; color: #000000 !important; font-weight: bold;">
-                {formatted_audit_html}
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-    with res2:
-        st.markdown(f"""
-        <div class="brutal-card">
-            <div class="brutal-header bg-cyan">📦 JSON PAYLOAD</div>
-            <pre style="background:#f4f1ea; color:#000000 !important; font-weight:bold; border: 3px solid #000; padding: 15px; margin-bottom: 15px;"><code>{extracted_json}</code></pre>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Add Export Download Buttons below JSON card
-        try:
-            parsed_json = json.loads(extracted_json)
-            json_string = json.dumps(parsed_json, indent=2)
-            
-            csv_string = json_to_csv(extracted_json)
-            
-            d_col1, d_col2 = st.columns(2)
-            with d_col1:
-                st.download_button(
-                    label="📥 Download JSON",
-                    data=json_string,
-                    file_name="invoice_payload.json",
-                    mime="application/json",
-                    type="secondary"
-                )
-            with d_col2:
-                st.download_button(
-                    label="📥 Download CSV",
-                    data=csv_string,
-                    file_name="invoice_payload.csv",
-                    mime="text/csv",
-                    type="secondary"
-                )
-        except Exception:
-            st.download_button(
-                label="📥 Download Raw Payload",
-                data=extracted_json,
-                file_name="invoice_payload.json",
-                mime="application/json",
-                type="secondary"
-            )
+
+def render_result(result: PipelineResult) -> None:
+    audit = result.audit
+    st.markdown("<hr style='border-top:4px solid #000;opacity:1'>", unsafe_allow_html=True)
+
+    k1, k2, k3, k4 = st.columns(4)
+    tier = audit.risk_tier.value
+    k1.markdown(f"""<div class="kpi tier-{tier}"><div class="label">RISK TIER</div>
+        <div class="value">{tier}</div><div class="scorebar"><div style="width:{audit.risk_score}%"></div></div>
+        <div class="label" style="margin-top:4px">SCORE {audit.risk_score}/100</div></div>""", unsafe_allow_html=True)
+    k2.markdown(f"""<div class="kpi bg-yellow"><div class="label">FINDINGS</div>
+        <div class="value">{len(audit.findings)}</div>
+        <div class="label">{sum(f.source == "rule" for f in audit.findings)} RULE ·
+        {sum(f.source == "llm" for f in audit.findings)} LLM</div></div>""", unsafe_allow_html=True)
+    k3.markdown(f"""<div class="kpi bg-cyan"><div class="label">LATENCY</div>
+        <div class="value">{result.total_latency_ms:,.1f} ms</div>
+        <div class="label">{len(result.trace)} PIPELINE STEPS</div></div>""", unsafe_allow_html=True)
+    k4.markdown(f"""<div class="kpi bg-lime"><div class="label">TOKENS</div>
+        <div class="value">{result.total_tokens:,}</div>
+        <div class="label">{result.mode.upper()} MODE</div></div>""", unsafe_allow_html=True)
+
+    st.markdown(f'<div class="brutal-card" style="margin-top:22px"><b>EXECUTIVE SUMMARY ▸</b> '
+                f'{esc(audit.summary)}</div>', unsafe_allow_html=True)
+
+    t_find, t_json, t_rag, t_trace = st.tabs(
+        ["🚩 FINDINGS", "📦 EXTRACTED JSON", "📚 RETRIEVED POLICIES", "🧭 PIPELINE TRACE"])
+
+    with t_find:
+        if not audit.findings:
+            st.markdown('<div class="finding sev-LOW"><div class="head">✅ No policy violations found</div></div>',
+                        unsafe_allow_html=True)
+        for f in audit.findings:
+            chips = "".join(f'<span class="chip">{esc(p)}</span>' for p in f.policy_ids)
+            st.markdown(f"""<div class="finding sev-{f.severity.value}">
+                <div class="head"><span>{esc(f.title)}</span>
+                <span><span class="chip sev">{f.severity.value}</span>
+                <span class="chip src-{esc(f.source)}">{esc(f.source.upper())}</span></span></div>
+                <div class="quote">“{esc(f.evidence)}”</div>
+                <div>{chips} <b>▸ ACTION:</b> {esc(f.recommendation)}</div></div>""", unsafe_allow_html=True)
+
+    with t_json:
+        payload = result.extraction.model_dump()
+        st.json(payload)
+        flat = {k: "; ".join(v) if isinstance(v, list) else v for k, v in payload.items()}
+        report = {"extraction": payload, "audit": audit.model_dump(mode="json")}
+        d1, d2, d3 = st.columns(3)
+        d1.download_button("📥 JSON", json.dumps(payload, indent=2), "invoice_payload.json", "application/json")
+        d2.download_button("📥 CSV", json_to_csv(json.dumps(flat)), "invoice_payload.csv", "text/csv")
+        d3.download_button("📥 FULL AUDIT", json.dumps(report, indent=2), "invoice_audit.json", "application/json")
+
+    with t_rag:
+        st.caption("Policy chunks placed in the auditor's context. `guardrail` = force-included because a rule cited it.")
+        for r in result.retrieved:
+            st.markdown(f"""<div class="finding sev-LOW"><div class="head">
+                <span>[{esc(r.chunk.id)}] {esc(r.chunk.title)}</span>
+                <span><span class="chip sev">{esc(r.retriever)}</span><span class="chip">score {r.score:.4f}</span></span></div>
+                <div style="font-size:.88rem;margin-top:6px">{esc(r.chunk.text)}</div></div>""", unsafe_allow_html=True)
+
+    with t_trace:
+        st.dataframe(pd.DataFrame([s.model_dump() for s in result.trace]), hide_index=True, width="stretch")
+
+
+if "result" in st.session_state:
+    render_result(st.session_state.result)
+
+# --- Evaluation harness ------------------------------------------------------------
+st.markdown("<hr style='border-top:4px solid #000;opacity:1'>", unsafe_allow_html=True)
+with st.expander("📊 EVALUATION HARNESS — score the pipeline on the labeled dataset", expanded=False):
+    st.caption(f"{len(SAMPLES)} labeled invoices · metrics: risk-tier accuracy, field-level extraction accuracy, "
+               "policy-citation precision / recall. Live mode spends Gemini tokens.")
+    if st.button(f"▶ RUN EVAL ({mode.upper()})", disabled=mode == "live" and client is None):
+        pipeline = get_pipeline(top_k)
+        with st.spinner("Evaluating…"):
+            scores = [score_case(c, pipeline.run(c["document"], mode=mode)) for c in SAMPLES]
+        summary = summarize(scores)
+        m = st.columns(4)
+        m[0].metric("Tier accuracy", f"{summary['tier_accuracy']:.0%}")
+        m[1].metric("Field accuracy", f"{summary['field_accuracy']:.0%}")
+        m[2].metric("Citation precision", f"{summary['policy_precision']:.0%}")
+        m[3].metric("Citation recall", f"{summary['policy_recall']:.0%}")
+        st.dataframe(pd.DataFrame([{
+            "case": s.id, "expected": s.expected_tier, "predicted": s.predicted_tier,
+            "tier ✓": s.tier_correct, "fields": f"{s.field_hits}/{s.field_total}",
+            "missed fields": ", ".join(s.field_misses), "latency ms": round(s.latency_ms, 1), "tokens": s.tokens,
+        } for s in scores]), hide_index=True, width="stretch")

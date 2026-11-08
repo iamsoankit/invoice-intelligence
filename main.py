@@ -1,58 +1,59 @@
-import os
-from google import genai
+"""Command-line entry point for the invoice audit pipeline.
+
+    python main.py path/to/invoice.txt            # offline (no API key)
+    python main.py path/to/invoice.pdf --live     # Gemini multimodal + hybrid RAG
+    python main.py --sample bec-routing-sms       # run a labeled sample
+"""
+
+import argparse
+import json
+import mimetypes
+import sys
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
+from invoice_intelligence.config import get_api_key
+from invoice_intelligence.evaluation import load_dataset
+from invoice_intelligence.pipeline import InvoicePipeline
 
-# Initialize the modern Gemini client using your existing API key
-client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
 
-# --- Mock Data ---
-mock_invoice_text = """
-INVOICE #9942
-Vendor: Global Aviation Supplies Ltd.
-Total Amount: $45,000.00
-Date: August 19, 2026
-Terms: Due on Receipt. 
-Note: Missing standard corporate tax ID on file.
-"""
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("path", nargs="?", type=Path, help="Invoice file (.txt, .pdf, .png, .jpg)")
+    source.add_argument("--sample", choices=[c["id"] for c in load_dataset()])
+    parser.add_argument("--live", action="store_true", help="Use Gemini instead of the offline engine.")
+    args = parser.parse_args()
 
-# --- Agent 1: Data Extractor ---
-extractor_prompt = f"""
-You are a Financial Data Extraction Specialist. 
-Extract the Vendor Name, Total Amount, Date, and Terms from the following text. 
-Output ONLY a valid JSON object without markdown formatting blocks.
+    client = None
+    if args.live:
+        load_dotenv()
+        from google import genai
 
-Text to extract:
-{mock_invoice_text}
-"""
+        if not get_api_key():
+            print("GOOGLE_API_KEY is not set.", file=sys.stderr)
+            return 2
+        client = genai.Client(api_key=get_api_key())
+
+    text, file_bytes, mime = "", None, None
+    if args.sample:
+        text = next(c["document"] for c in load_dataset() if c["id"] == args.sample)
+    elif args.path.suffix.lower() in {".txt", ".md", ""}:
+        text = args.path.read_text(encoding="utf-8")
+    else:
+        file_bytes = args.path.read_bytes()
+        mime = mimetypes.guess_type(args.path.name)[0] or "application/octet-stream"
+
+    result = InvoicePipeline(client=client).run(text, file_bytes, mime, mode="live" if args.live else "offline")
+    print(json.dumps({
+        "extraction": result.extraction.model_dump(),
+        "audit": result.audit.model_dump(mode="json"),
+        "retrieved_policies": [r.chunk.id for r in result.retrieved],
+        "trace": [s.model_dump() for s in result.trace],
+    }, indent=2))
+    return 0
+
 
 if __name__ == "__main__":
-    print("--- Starting Agent 1: Data Extraction ---")
-    
-    extracted_response = client.models.generate_content(
-        model='gemini-3.6-flash',
-        contents=extractor_prompt
-    )
-    extracted_json = extracted_response.text.strip()
-    print(extracted_json)
-    
-    # --- Agent 2: Risk Analyst ---
-    analyst_prompt = f"""
-    You are a meticulous corporate Risk Analyst. 
-    Review the following JSON data. Flag any financial risks in a short bulleted list, 
-    such as aggressive payment terms (e.g., Due on Receipt) or missing documentation. 
-    If none, state 'No risks identified'.
-
-    Extracted JSON Data:
-    {extracted_json}
-    """
-    
-    print("\n--- Starting Agent 2: Risk Analysis ---")
-    
-    risk_analysis = client.models.generate_content(
-        model='gemini-3.6-flash',
-        contents=analyst_prompt
-    )
-    print(risk_analysis.text.strip())
+    sys.exit(main())
