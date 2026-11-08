@@ -165,3 +165,40 @@ def test_legacy_helpers():
     assert extract_risk_tier("[CRITICAL]\n- x") == "CRITICAL"
     assert extract_risk_tier("nothing") == "MODERATE"
     assert json_to_csv('{"a": 1, "b": "x"}').splitlines() == ["a,b", "1,x"]
+
+
+# --- Policy Q&A and batch portfolio ---------------------------------------------------
+
+def test_offline_policy_qa_cites_relevant_policy():
+    answer, retrieved, step = InvoicePipeline().ask("Can we release payment before the W-9 arrives?")
+    assert answer.grounded and answer.cited_ids[0] == "TAX-01"
+    assert "[TAX-01]" in answer.answer and step.input_tokens == 0
+
+
+def test_offline_policy_qa_refuses_out_of_scope():
+    answer, _, _ = InvoicePipeline().ask("what is the weather today")
+    assert not answer.grounded and answer.cited_ids == []
+
+
+def test_live_policy_qa_strips_unretrieved_citations():
+    client = fake_client()
+    client.models.generate_content = lambda model, contents, config: SimpleNamespace(
+        text=json.dumps({"answer": "Freeze it [BANK-01].", "cited_ids": ["BANK-01", "FAKE-1"], "grounded": True}),
+        usage_metadata=SimpleNamespace(prompt_token_count=50, candidates_token_count=10))
+    from invoice_intelligence.qa import answer_question
+
+    retrieved = BM25Retriever(CHUNKS).search("bank account change", k=3)
+    answer, tin, tout = answer_question("bank change?", retrieved, client)
+    assert answer.cited_ids == ["BANK-01"] and (tin, tout) == (50, 10)
+
+
+def test_portfolio_summary_from_samples():
+    from invoice_intelligence.portfolio import portfolio_rows, portfolio_summary
+
+    pipeline = InvoicePipeline()
+    rows = portfolio_rows([(c["id"], pipeline.run(c["document"])) for c in CASES.values()])
+    summary = portfolio_summary(rows)
+    assert summary["documents"] == len(CASES)
+    assert summary["tiers"] == {"SECURE": 2, "MODERATE": 2, "CRITICAL": 4}
+    assert rows[0]["action"] == "HOLD" and rows[-1]["action"] == "PAY"
+    assert summary["amount_on_hold"] == 145000 + 125500 + 18400 + 62300

@@ -1,0 +1,54 @@
+name: Live eval (Gemini)
+
+# Runs the labeled eval set against the real Gemini API. Needs a repository
+# secret named GOOGLE_API_KEY; without it the job skips cleanly.
+on:
+  workflow_dispatch:
+    inputs:
+      top_k:
+        description: Policies retrieved per audit
+        default: "4"
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  live-eval:
+    runs-on: ubuntu-latest
+    env:
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Check for API key
+        id: key
+        run: |
+          if [ -n "$GOOGLE_API_KEY" ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GOOGLE_API_KEY secret not set; skipping live eval."
+          fi
+      - if: steps.key.outputs.present == 'true'
+        run: pip install -r requirements.txt
+      - if: steps.key.outputs.present == 'true'
+        name: Run live eval
+        shell: bash
+        env:
+          TOP_K: ${{ inputs.top_k || '4' }}
+        run: |
+          python -m evals.run_eval --mode live --top-k "$TOP_K" --output reports/live-eval.json \
+            | tee reports-summary.txt
+          {
+            echo '## Live eval (Gemini)'
+            echo '```'
+            cat reports-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - if: steps.key.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-eval-report
+          path: reports/live-eval.json

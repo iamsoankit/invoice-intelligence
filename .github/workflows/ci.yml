@@ -20,4 +20,9 @@ jobs:
       - run: ruff check .
       - run: pytest -q
       - name: Offline eval regression gate
-        run: python -m evals.run_eval --min-tier-accuracy 1.0
+        run: python -m evals.run_eval --min-tier-accuracy 1.0 --output reports/offline-eval.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: offline-eval-report
+          path: reports/offline-eval.json

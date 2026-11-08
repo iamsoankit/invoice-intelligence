@@ -7,6 +7,8 @@
 import argparse
 import json
 import sys
+from dataclasses import asdict
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -20,6 +22,7 @@ def main() -> int:
     parser.add_argument("--mode", choices=["offline", "live"], default="offline")
     parser.add_argument("--top-k", type=int, default=4)
     parser.add_argument("--json", action="store_true", help="Print the summary as JSON.")
+    parser.add_argument("--output", type=Path, help="Also write a full per-case JSON report to this path.")
     parser.add_argument("--min-tier-accuracy", type=float, default=0.0,
                         help="Exit non-zero if tier accuracy falls below this (for CI regression gates).")
     args = parser.parse_args()
@@ -42,6 +45,11 @@ def main() -> int:
         scores.append(score_case(case, result))
 
     summary = summarize(scores)
+    if args.output:
+        report = {"mode": args.mode, "top_k": args.top_k, "summary": summary,
+                  "cases": [{**asdict(s), "tier_correct": s.tier_correct} for s in scores]}
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(report, indent=2))
     if args.json:
         print(json.dumps(summary, indent=2))
     else:

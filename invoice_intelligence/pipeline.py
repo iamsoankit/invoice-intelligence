@@ -46,6 +46,29 @@ class InvoicePipeline:
             self._agents = GeminiAgents(self.client)
         return self._agents
 
+    def retriever_for(self, mode: str):
+        """Hybrid (BM25 + dense) in live mode, BM25 offline. Returns (retriever, note)."""
+        if mode != "live" or self.client is None:
+            return self.bm25, ""
+        try:
+            if self._dense is None:
+                self._dense = EmbeddingRetriever(self.chunks, self.client)
+            return HybridRetriever([self.bm25, self._dense]), ""
+        except Exception as exc:  # embeddings are an enhancement; never fail the audit on them
+            return self.bm25, f"Embedding index unavailable ({type(exc).__name__}); "
+
+    def ask(self, question: str, mode: str = "offline"):
+        """Policy Q&A over the knowledge base. Returns (PolicyAnswer, retrieved, TraceStep)."""
+        from .qa import answer_question
+
+        start = time.perf_counter()
+        retriever, note = self.retriever_for(mode)
+        retrieved = retriever.search(question, k=self.top_k)
+        answer, tin, tout = answer_question(question, retrieved, self.client if mode == "live" else None)
+        step = TraceStep(name="Policy Q&A", latency_ms=round((time.perf_counter() - start) * 1000, 1),
+                         input_tokens=tin, output_tokens=tout, detail=f"{note}{retriever.name}")
+        return answer, retrieved, step
+
     def run(self, document: str = "", file_bytes: bytes | None = None, mime_type: str | None = None,
             mode: str = "offline") -> PipelineResult:
         if mode == "live" and self.client is None:
@@ -83,14 +106,7 @@ class InvoicePipeline:
 
         with step("3 · Retriever") as s:
             query = build_retrieval_query(extraction, rules_text)
-            retriever = self.bm25
-            if mode == "live":
-                try:
-                    if self._dense is None:
-                        self._dense = EmbeddingRetriever(self.chunks, self.client)
-                    retriever = HybridRetriever([self.bm25, self._dense])
-                except Exception as exc:  # embeddings are an enhancement; never fail the audit on them
-                    s.detail = f"Embedding index unavailable ({type(exc).__name__}); "
+            retriever, s.detail = self.retriever_for(mode)
             retrieved = retriever.search(query, k=self.top_k)
             # Policies cited by guardrails are always in context, even if ranked lower.
             have = {r.chunk.id for r in retrieved}
