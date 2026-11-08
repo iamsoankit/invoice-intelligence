@@ -70,9 +70,9 @@ with st.sidebar:
     html_block('<div class="side-card"><div class="brutal-header bg-lime">⚡ ENGINE</div>'
                "Pick how every tab runs.</div>")
     mode_label = st.radio(
-        "Execution mode", ["OFFLINE · deterministic", "LIVE · Gemini"], index=1 if client else 0,
+        "Execution mode", ["OFFLINE · deterministic", "LIVE · Gemini"], index=0,
         help="Offline: regex extractor + BM25 + rule engine. Free, instant, no key. "
-             "Live: Gemini structured extraction, hybrid RAG, grounded LLM auditor.",
+             "Live: Gemini structured extraction, hybrid RAG, grounded LLM auditor (spends API quota).",
     )
     mode = "live" if mode_label.startswith("LIVE") else "offline"
     live_blocked = mode == "live" and client is None
